@@ -1,0 +1,166 @@
+#!/usr/bin/env python2
+
+import argparse
+import multiprocessing.pool
+import os.path
+import sys
+
+import httplib2
+http = httplib2.Http()
+
+import nflgame
+import nflvid
+
+
+def eprint(s):
+    print >> sys.stderr, s
+
+
+def fatal(s):
+    eprint(s)
+    sys.exit(1)
+
+
+def is_dead(url):
+    resp, _ = http.request(url, 'HEAD')
+    return resp['status'] != '200'
+
+parser = argparse.ArgumentParser(
+    description='Download NFL game footage.',
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+aa = parser.add_argument
+aa('footage_dir', type=str,
+   help='The directory containing your footage data. All footage will be '
+        'saved as "{footage_dir}/{eid}.mp4".')
+aa('--threads', default=2, type=int,
+   help='The number of concurrent ffmpeg/rtmpdump instances to run.'
+        'When using --broadcast, try setting this to twice the number '
+        'of logical CPUs in your machine.')
+
+aa('--season', default=2015, type=int, choices=[2011, 2012, 2013, 2014, 2015,2016],
+   help='The season to download video from.')
+aa('--weeks', default=None, type=int, nargs='+',
+   help='The weeks to download video from.')
+aa('--teams', default=None, type=str, nargs='+',
+   help='The teams to download video of.')
+aa('--season-type', default='REG', choices=['PRE', 'REG', 'POST'],
+   help='The part of the season to search.')
+aa('--dry-run', action='store_true',
+   help='When set, only the first 30 seconds of each game will be downloaded. '
+        'This is useful to test your setup and make sure things are working '
+        'before committing to a long job.')
+aa('--progress', action='store_true',
+   help='When set, this program will output all matching games and report '
+        'whether there is footage for them.')
+aa('--files', action='store_true',
+   help='When set, this program will output all matching files in the '
+        'given directory, one per line.')
+aa('--broadcast', action='store_true',
+   help='When set, broadcast footage will be downloaded in lieu of coach '
+        'footage. This is EXPERIMENTAL.')
+aa('--condensed', action='store_true',
+   help='When set, condensed broadcast footage will be downloaded. '
+        'This is EXPERIMENTAL.')
+aa('--quality', default='1600',
+   choices=['400', '800', '1200', '1600', '2400', '3000', '4500'],
+   help='The video/audio quality to use for broadcast footage. '
+        '4500 is the best. Coach video always has quality 1600.')
+aa('--show-url', action='store_true',
+   help='When set, the m3u8 HLS urls will be printed to stdout and the '
+        'program will quit without doing anything else.'
+        'This implies --broadcast.')
+aa('--show-dead', action='store_true',
+   help='Checks whether a URL is valid or not using a HEAD request. '
+        'Only applicable when --show-url is used.'
+        'This implies --broadcast.')
+aa('--no-confirm', action='store_true',
+   help='When set, confirmation will be skipped.')
+args = parser.parse_args()
+
+if args.condensed:
+    args.broadcast = True
+if args.show_url:
+    args.broadcast = True
+if args.threads < 1:
+    fatal('Threads must be at least 1.')
+if args.teams is not None:
+    args.teams = set(map(str.upper, args.teams))
+
+matched = []
+for info in nflgame.sched.games.itervalues():
+    season, season_type = info['year'], info['season_type']
+    week = info['week']
+    teams = (info['home'], info['away'])
+    if args.season != season:
+        continue
+    if args.season_type != season_type:
+        continue
+    if args.weeks is not None and week not in args.weeks:
+        continue
+    if args.teams is not None and len(args.teams.intersection(teams)) == 0:
+        continue
+
+    g = nflgame.game.Game(info['eid'])
+    if g is None or not g.game_over():
+        continue
+    if not args.show_url and not args.progress and not args.files \
+            and nflvid.footage_full(args.footage_dir, g.eid) is not None:
+        continue
+
+    matched.append(nflgame.game.Game(info['eid']))
+matched = filter(lambda g: g is not None, matched)
+
+if len(matched) == 0:
+    fatal('No games matched your search criteria.')
+if args.files:
+    for g in sorted(matched, key=lambda g: int(g.eid)):
+        p = nflvid.footage_full(args.footage_dir, g.eid)
+        if p is not None:
+            print p
+    sys.exit(0)
+if args.progress:
+    for g in sorted(matched, key=lambda g: int(g.eid)):
+        status = nflvid.footage_full(args.footage_dir, g.eid)
+        status = os.path.basename(status) if status is not None else 'NONE'
+
+        print 'Season %d, Week %02d, %03s at %03s (%s)' \
+            % (g.season(), g.schedule['week'], g.away, g.home, status)
+    sys.exit(0)
+if args.show_url:
+    for g in matched:
+        urls = nflvid.broadcast_urls(g, args.quality, condensed=args.condensed)
+        print nflvid._nice_game(g)
+        if args.show_dead:
+            url = nflvid.first_valid_broadcast_url(urls)
+            if url is None:
+                print 'DEAD'
+            else:
+                print url
+        else:
+            print '\n'.join(urls)
+        print '-' * 80
+        sys.stdout.flush()
+    sys.exit(0)
+
+eprint("These are the games that match your search criteria:")
+confmesg = "Are you sure you want to start downloading? [y/n] "
+for g in matched:
+    eprint(nflvid._nice_game(g))
+if args.no_confirm:
+    eprint(confmesg + 'y')
+else:
+    confirm = raw_input(confmesg)
+    if not confirm.lower().startswith('y'):
+        sys.exit(1)
+
+
+# Okay, we've warned the user enough. Let's start downloading.
+def dodown(g):
+    if args.broadcast:
+        nflvid.download_broadcast(args.footage_dir, g,
+                                  args.quality, args.dry_run,
+                                  condensed=args.condensed)
+    else:
+        nflvid.download_coach(args.footage_dir, g, args.dry_run)
+pool = multiprocessing.pool.ThreadPool(args.threads)
+pool.map(dodown, matched)
